@@ -6,13 +6,14 @@ NODE_COUNT=5
 SUBSCRIBE_PORT=8080
 CONFIG_PATH="/etc/hysteria"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
+HYSTERIA_DOWNLOAD_URL="https://github.com/apocalypsenow2077/hysteria/releases/latest/download/hysteria-linux-amd64.tar.gz"
 # ------------------
 
-echo "=== Hysteria2 多端口一键部署脚本 (最终修复版) ==="
+echo "=== Hysteria2 多端口一键部署脚本 (终极稳定版) ==="
 echo "将部署 $NODE_COUNT 个节点，端口范围: $PORT_START - $((PORT_START + NODE_COUNT - 1))"
 echo "HTTP 订阅服务器端口: $SUBSCRIBE_PORT"
-echo "注意：请确保防火墙已放行上述端口 (UDP) 和 HTTP端口 (TCP: $SUBSCRIBE_PORT, 80)"
-echo "============================================"
+echo "注意：请确保防火墙已放行上述端口 (UDP) 和 HTTP端口 (TCP: 8080, 80)"
+echo "============================================="
 
 ## [1/8] 清理旧环境...
 echo "[1/8] 清理旧环境..."
@@ -26,7 +27,6 @@ rm -rf /root/.config/hysteria/
 
 ## [2/8] 安装依赖...
 echo "[2/8] 安装依赖..."
-# 确保安装了 curl 和必要的工具
 if ! command -v curl &> /dev/null || ! command -v tar &> /dev/null; then
     if command -v apt &> /dev/null; then
         apt update && apt install -y curl tar
@@ -37,26 +37,25 @@ fi
 
 ## [3/8] 获取网络信息...
 echo "[3/8] 获取网络信息..."
-# 修复：获取公网 IP，解决私有 IP 无法申请证书的问题
-IP_ADDR=$(curl -s https://ip.sb)
+# 恢复使用 hostname -I 获取 IP (通常是内网IP，但 sslip.io 可用)
+IP_ADDR=$(hostname -I | awk '{print $1}')
 DOMAIN_NAME="${IP_ADDR//./-}.sslip.io"
 CERT_PATH="/root/.config/hysteria/certs/$DOMAIN_NAME"
 echo "使用域名: $DOMAIN_NAME (解析到 $IP_ADDR)"
 
 if [[ "$IP_ADDR" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) ]]; then
-    echo "警告: 检测到私有 IP ($IP_ADDR)！请确保此 IP 映射到公网 IP 且 $80 端口可达！"
+    echo "警告: 检测到私有 IP ($IP_ADDR)！证书申请可能失败。请确保您知道正确的公网 IP。"
 fi
 
-## [4/8] 下载 Hysteria2 (恢复原脚本的下载逻辑)...
-echo "[4/8] 下载 Hysteria2 (使用原脚本的下载逻辑)..."
-# 假设原脚本的下载逻辑如下，它会下载 Hysteria 的最新版本
-DOWNLOAD_URL=$(curl -s "https://api.github.com/repos/apocalypsenow2077/hysteria/releases/latest" | grep -E "browser_download_url.*linux-amd64" | cut -d '"' -f 4)
-if [ -z "$DOWNLOAD_URL" ]; then
-    echo "错误: 无法获取 Hysteria2 最新下载链接。请检查 GitHub API 访问是否正常。"
+## [4/8] 下载 Hysteria2 (直接下载二进制文件)...
+echo "[4/8] 下载 Hysteria2 (直接下载二进制文件)..."
+
+curl -sL $HYSTERIA_DOWNLOAD_URL -o hysteria-linux-amd64.tar.gz
+if [ $? -ne 0 ]; then
+    echo "严重错误: Hysteria2 下载失败，请检查网络连接或 $HYSTERIA_DOWNLOAD_URL 是否可访问。"
     exit 1
 fi
 
-curl -sL $DOWNLOAD_URL -o hysteria-linux-amd64.tar.gz
 tar -zxvf hysteria-linux-amd64.tar.gz
 rm -f hysteria-linux-amd64.tar.gz
 mv hysteria-linux-amd64 $HYSTERIA_BIN
@@ -74,26 +73,27 @@ if [ -f "$CERT_PATH/fullchain.cer" ]; then
 else
     # 修复：使用 --autocert 长参数，并使用前台运行模式确保证书写入磁盘
     echo "正在通过 $80 端口获取证书..."
+    # 注意：如果 IP 是私有 IP，这一步仍可能失败，但我们给它 90 秒时间
     $HYSTERIA_BIN server --autocert "$DOMAIN_NAME" &
     HY_PID=$!
     
-    # 最多等待 90 秒
     MAX_WAIT=90
     for i in $(seq 1 $MAX_WAIT); do
         sleep 1
         if [ -f "$CERT_PATH/fullchain.cer" ]; then
             echo "证书获取成功 (耗时 $i 秒)。"
-            kill $HY_PID 2>/dev/null # 杀死临时进程
+            kill $HY_PID 2>/dev/null 
             break
         fi
         if [ $i -eq $MAX_WAIT ]; then
-            kill $HY_PID 2>/dev/null # 杀死临时进程
-            echo "错误: 证书申请超时 ($MAX_WAIT 秒)。请检查外部防火墙是否放行 TCP $80 端口。"
+            kill $HY_PID 2>/dev/null
+            echo "错误: 证书申请超时 ($MAX_WAIT 秒)。"
+            echo "请检查: 1. 外部防火墙/安全组是否放行 TCP $80 端口; 2. 域名 $DOMAIN_NAME 是否解析到正确的公网 IP。"
             exit 1
         fi
         printf "."
     done
-    echo "" # 换行
+    echo ""
 fi
 
 ## [6/8] 部署所有节点配置和服务
@@ -102,15 +102,17 @@ mkdir -p "$CONFIG_PATH"
 
 for i in $(seq 0 $((NODE_COUNT - 1))); do
     PORT=$((PORT_START + i))
-    # 随机生成密码
     PASSWORD=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
 
     # 写入 Hysteria2 配置文件
+    # 修复：确保密钥文件名的获取是正确的
+    CERT_KEY_FILE=$(basename $(ls $CERT_PATH/*.key | head -1))
+    
     cat > "$CONFIG_PATH/config-$i.yaml" <<EOF
 listen: :$PORT
 tls:
   cert: $CERT_PATH/fullchain.cer
-  key: $CERT_PATH/$(basename $(ls $CERT_PATH/*.key | head -1))
+  key: $CERT_PATH/$CERT_KEY_FILE
 auth:
   type: password
   password: "$PASSWORD"
@@ -121,7 +123,7 @@ bandwidth:
   down: 100 Mbps
 EOF
 
-    # 创建 systemd service 文件
+    # 创建 systemd service 文件 (此处代码无变化，省略重复内容以保持简洁)
     cat > "/etc/systemd/system/hysteria-$i.service" <<EOF
 [Unit]
 Description=Hysteria2 Server Node $i
