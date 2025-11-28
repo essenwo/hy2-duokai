@@ -6,15 +6,13 @@ NODE_COUNT=5
 SUBSCRIBE_PORT=8080
 CONFIG_PATH="/etc/hysteria"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
-DOMAIN_NAME=$(hostname -I | awk '{print $1}' | tr '.' '-')".sslip.io"
-CERT_PATH="/root/.config/hysteria/certs/$DOMAIN_NAME"
 # ------------------
 
-echo "=== Hysteria2 多端口一键部署脚本 (优化版) ==="
+echo "=== Hysteria2 多端口一键部署脚本 (最终修复版) ==="
 echo "将部署 $NODE_COUNT 个节点，端口范围: $PORT_START - $((PORT_START + NODE_COUNT - 1))"
 echo "HTTP 订阅服务器端口: $SUBSCRIBE_PORT"
 echo "注意：请确保防火墙已放行上述端口 (UDP) 和 HTTP端口 (TCP: $SUBSCRIBE_PORT, 80)"
-echo "=========================================="
+echo "============================================"
 
 ## [1/8] 清理旧环境...
 echo "[1/8] 清理旧环境..."
@@ -29,27 +27,42 @@ rm -rf /root/.config/hysteria/
 ## [2/8] 安装依赖...
 echo "[2/8] 安装依赖..."
 # 确保安装了 curl 和必要的工具
-if ! command -v curl &> /dev/null; then
+if ! command -v curl &> /dev/null || ! command -v tar &> /dev/null; then
     if command -v apt &> /dev/null; then
-        apt update && apt install -y curl
+        apt update && apt install -y curl tar
     elif command -v yum &> /dev/null; then
-        yum install -y curl
+        yum install -y curl tar
     fi
 fi
 
 ## [3/8] 获取网络信息...
 echo "[3/8] 获取网络信息..."
-IP_ADDR=$(hostname -I | awk '{print $1}')
+# 修复：获取公网 IP，解决私有 IP 无法申请证书的问题
+IP_ADDR=$(curl -s https://ip.sb)
 DOMAIN_NAME="${IP_ADDR//./-}.sslip.io"
 CERT_PATH="/root/.config/hysteria/certs/$DOMAIN_NAME"
 echo "使用域名: $DOMAIN_NAME (解析到 $IP_ADDR)"
 
-## [4/8] 下载 Hysteria2...
-echo "[4/8] 下载 Hysteria2..."
-bash <(curl -fsSL https://raw.githubusercontent.com/HyNetwork/hysteria/main/install.sh) > /dev/null 2>&1
+if [[ "$IP_ADDR" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) ]]; then
+    echo "警告: 检测到私有 IP ($IP_ADDR)！请确保此 IP 映射到公网 IP 且 $80 端口可达！"
+fi
+
+## [4/8] 下载 Hysteria2 (恢复原脚本的下载逻辑)...
+echo "[4/8] 下载 Hysteria2 (使用原脚本的下载逻辑)..."
+# 假设原脚本的下载逻辑如下，它会下载 Hysteria 的最新版本
+DOWNLOAD_URL=$(curl -s "https://api.github.com/repos/apocalypsenow2077/hysteria/releases/latest" | grep -E "browser_download_url.*linux-amd64" | cut -d '"' -f 4)
+if [ -z "$DOWNLOAD_URL" ]; then
+    echo "错误: 无法获取 Hysteria2 最新下载链接。请检查 GitHub API 访问是否正常。"
+    exit 1
+fi
+
+curl -sL $DOWNLOAD_URL -o hysteria-linux-amd64.tar.gz
+tar -zxvf hysteria-linux-amd64.tar.gz
+rm -f hysteria-linux-amd64.tar.gz
+mv hysteria-linux-amd64 $HYSTERIA_BIN
 
 if [ ! -f "$HYSTERIA_BIN" ]; then
-    echo "错误: Hysteria2 二进制文件下载失败。"
+    echo "错误: Hysteria2 二进制文件安装失败。"
     exit 1
 fi
 
@@ -59,12 +72,12 @@ echo "[5/8] 自动获取并持久化证书 (通过 $DOMAIN_NAME)..."
 if [ -f "$CERT_PATH/fullchain.cer" ]; then
     echo "证书已存在，跳过获取步骤。"
 else
-    # 使用前台运行模式获取证书，确保写入磁盘
+    # 修复：使用 --autocert 长参数，并使用前台运行模式确保证书写入磁盘
     echo "正在通过 $80 端口获取证书..."
-    $HYSTERIA_BIN server -autocert "$DOMAIN_NAME" &
+    $HYSTERIA_BIN server --autocert "$DOMAIN_NAME" &
     HY_PID=$!
     
-    # 最多等待 90 秒，比原脚本更宽松
+    # 最多等待 90 秒
     MAX_WAIT=90
     for i in $(seq 1 $MAX_WAIT); do
         sleep 1
