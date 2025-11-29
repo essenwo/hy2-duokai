@@ -23,7 +23,7 @@ echo "[INFO] Mode 1: Installing ${COUNT} new nodes"
 SELECTED_IP="$(curl -s --max-time 10 https://ip.sb || ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1)"
 if [[ "$SELECTED_IP" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) || -z "${SELECTED_IP}" ]]; then
   echo "[WARN] No public IPv4 detected or IP query failed. Trying local IP."
-  SELECTED_IP="$(ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)"
+  SELECTED_IP="$(curl -s --max-time 10 https://api.ipify.org || curl -s --max-time 10 https://ifconfig.me || curl -s --max-time 10 https://ip.sb || ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1)"
   if [ -z "${SELECTED_IP}" ]; then
     echo "[ERR] No IP detected, exiting script."
     exit 1
