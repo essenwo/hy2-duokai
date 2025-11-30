@@ -60,9 +60,38 @@ esac
 # ===========================
 # 0) 获取公网 IPv4
 # ===========================
-SELECTED_IP="$(ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)"
-if [ -z "${SELECTED_IP}" ]; then echo "[ERR] 未检测到公网 IPv4" >&2; exit 1; fi
-echo "[OK] 使用 IP: ${SELECTED_IP}"
+# ===========================
+# 0) 获取公网 IPv4
+# ===========================
+# 优先尝试从本机网络接口获取
+LOCAL_IP="$(ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)"
+
+# 检查获取到的 IP 是否为内网 IP
+# 内网 IP 范围: 10.x.x.x, 172.16.x.x-172.31.x.x, 192.168.x.x
+IS_PRIVATE=0
+case "${LOCAL_IP}" in
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+        IS_PRIVATE=1
+        ;;
+esac
+
+# 如果本地获取的是内网IP，或者没获取到，则通过外部服务获取公网IP
+if [ "$IS_PRIVATE" -eq 1 ] || [ -z "$LOCAL_IP" ]; then
+    echo "[INFO] 本地IP (${LOCAL_IP:-"未找到"}) 为内网IP，尝试从外部服务获取公网IP..."
+    # 使用 curl 从多个可靠的服务轮流尝试，确保成功率
+    SELECTED_IP=$(curl -s4 ifconfig.me || curl -s4 api.ipify.org || curl -s4 ip.sb)
+else
+    echo "[INFO] 本地检测到公网IP: ${LOCAL_IP}"
+    SELECTED_IP="$LOCAL_IP"
+fi
+
+# 最终检查，如果还是没有IP，则脚本退出
+if [ -z "${SELECTED_IP}" ]; then
+  echo "[ERR] 无法通过任何方式获取到有效的公网 IPv4 地址，脚本退出。" >&2
+  exit 1
+fi
+echo "[OK] 确认使用公网 IP: ${SELECTED_IP}"
+
 
 # ===========================
 # 1) 安装依赖
