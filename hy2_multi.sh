@@ -1,312 +1,339 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
-# ===== Script Parameters =====
+# ===== 可改参数 =====
+# 修改为端口数组，用于创建5个不同端口的实例
+HY2_PORTS=(20000 20001 20002 20003 20004)
+HY2_PASS="${HY2_PASS:-}"              # HY2 密码（所有端口共享，留空自动生成）
+OBFS_PASS="${OBFS_PASS:-}"            # 混淆密码（所有端口共享，留空自动生成）
+NAME_TAG="${NAME_TAG:-MyHysteria}"    # 节点名称前缀
+PIN_SHA256="${PIN_SHA256:-}"          # 证书指纹（可留空）
 
-COUNT=5
-HY2_PORT_START="${HY2_PORT_START:-30001}"
-NAME_TAG_BASE="${NAME_TAG_BASE:-MyHysteria_}"
-CLASH_WEB_DIR="${CLASH_WEB_DIR:-/etc/hysteria}"
-HTTP_PORT="${HTTP_PORT:-8080}"
+CLASH_WEB_DIR="/etc/hysteria" # 将 Clash 订阅文件也放在 /etc/hysteria
+HTTP_PORT="${HTTP_PORT:-80}"  # 您已开启80端口，默认使用80
 
-# ---- helper: escape replacement for sed ----
+# ---- helper: escape replacement for sed (escape & and / and @ and newline) ----
 escape_for_sed() {
-  printf '%s' "$1" | sed -e 's/[\\/&@]/\\\\&/g' -e ':a' -e 'N' -e '$!ba' -e 's/\\n/\\\\n/g'
+  printf '%s' "$1" | sed -e 's/[\/&@]/\\&/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
 }
 
 # ===========================
-# 0) Get Public IP and Install Dependencies
+# helper: 定义定时维护任务（每天清缓存+硬重启）
 # ===========================
-echo "[INFO] Mode 1: Installing ${COUNT} new nodes"
-
-SELECTED_IP="$(curl -s --max-time 10 https://ip.sb || ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1)"
-if [[ "$SELECTED_IP" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) || -z "${SELECTED_IP}" ]]; then
-  echo "[WARN] No public IPv4 detected or IP query failed. Trying local IP."
-  SELECTED_IP="$(curl -s --max-time 10 https://api.ipify.org || curl -s --max-time 10 https://ifconfig.me || curl -s --max-time 10 https://ip.sb || ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1)"
-  if [ -z "${SELECTED_IP}" ]; then
-    echo "[ERR] No IP detected, exiting script."
-    exit 1
+setup_auto_reboot_cron() {
+  if [ "${ENABLE_AUTO_REBOOT_CACHE:-1}" != "1" ]; then
+    echo "[INFO] 自动维护任务已禁用（ENABLE_AUTO_REBOOT_CACHE=0）"
+    return 0
   fi
-  echo "[WARN] Using local IP: ${SELECTED_IP}. Ensure port 80 is mapped correctly!"
-else
-  echo "[OK] Using public IP: ${SELECTED_IP}"
-fi
+  local SHUTDOWN_BIN; SHUTDOWN_BIN="$(command -v shutdown || echo /sbin/shutdown)"
+  local SYNC_BIN; SYNC_BIN="$(command -v sync || echo /usr/bin/sync)"
+  local DROP_CACHES="/proc/sys/vm/drop_caches"
+  if [ ! -w "$DROP_CACHES" ]; then echo "[WARN] 无法写入 $DROP_CACHES"; fi
+  local CRON_LINE="0 3 * * * ${SYNC_BIN} && echo 3 > ${DROP_CACHES} && ${SHUTDOWN_BIN} -r now"
+  if ! command -v crontab >/dev/null; then
+      if command -v apt-get >/dev/null; then
+        echo "[INFO] 安装 cron..."
+        DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 && apt-get install -y cron >/dev/null 2>&1
+      else
+        echo "[WARN] 未找到 crontab 且无法自动安装。"
+      fi
+  fi
+  if command -v crontab >/dev/null; then
+    (crontab -l 2>/dev/null | grep -Fv "$CRON_LINE"; echo "$CRON_LINE") | crontab -
+    echo "[OK] 已添加 root 定时任务：每天 03:00 清缓存并重启"
+  fi
+}
 
+
+# ===========================
+# 模式选择
+# ===========================
+SCRIPT_MODE="${SCRIPT_MODE:-}"
+if [ -z "$SCRIPT_MODE" ] && [ -t 0 ]; then
+  read -r -p "请选择模式: 1) 全新安装  2) 仅添加每天自动清缓存+硬重启 [默认1]: " SCRIPT_MODE || true
+fi
+case "${SCRIPT_MODE}" in
+  2) echo "[INFO] 模式2：仅添加维护任务"; setup_auto_reboot_cron; echo "[OK] 任务已添加"; exit 0 ;;
+  *) echo "[INFO] 模式1：全新安装" ;;
+esac
+
+# ===========================
+# 0) 获取公网 IPv4
+# ===========================
+SELECTED_IP="$(ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)"
+if [ -z "${SELECTED_IP}" ]; then echo "[ERR] 未检测到公网 IPv4" >&2; exit 1; fi
+echo "[OK] 使用 IP: ${SELECTED_IP}"
+
+# ===========================
+# 1) 安装依赖
+# ===========================
 export DEBIAN_FRONTEND=noninteractive
 pkgs=(curl jq openssl python3 nginx)
-MISSING=0
-for p in "${pkgs[@]}"; do
-  if ! command -v "$p" >/dev/null 2>&1; then MISSING=1; break; fi
-done
-if [ "$MISSING" -eq 1 ]; then
-  echo "[*] Installing dependencies..."
-  apt-get update -y >/dev/null 2>&1
-  apt-get install -y "${pkgs[@]}" >/dev/null 2>&1
+if ! dpkg -s "${pkgs[@]}" >/dev/null 2>&1; then
+  apt-get update -y && apt-get install -y "${pkgs[@]}"
 fi
 
 # ===========================
-# 1) Generate Domain/IP and Install Hysteria
+# 2) 生成域名
 # ===========================
 IP_DASH="${SELECTED_IP//./-}"
-HY2_DOMAIN="${IP_DASH}.sslip.io"
-echo "[OK] Using domain/IP: ${HY2_DOMAIN} -> ${SELECTED_IP}"
-
-if ! command -v hysteria >/dev/null 2>&1; then
-  echo "[*] Installing hysteria..."
-  arch="$(uname -m)"; asset="hysteria-linux-amd64"
-  case "$arch" in aarch64|arm64) asset="hysteria-linux-arm64" ;; esac
-  ver="$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name')"
-  if [ -z "$ver" ]; then
-    echo "[ERR] Could not get Hysteria version from GitHub API. Check network or install manually."
-    exit 1
+DOMAIN_SERVICES=("sslip.io" "nip.io")
+HY2_DOMAIN=""
+for service in "${DOMAIN_SERVICES[@]}"; do
+  test_domain="${IP_DASH}.${service}"
+  echo "[*] 测试 ${service}: ${test_domain}"
+  resolved_ip="$(getent ahostsv4 "$test_domain" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
+  if [ "$resolved_ip" = "$SELECTED_IP" ]; then
+    HY2_DOMAIN="$test_domain"
+    echo "[OK] ${service} 解析正常: ${test_domain}"
+    break
+  else
+    echo "[WARN] ${service} 解析失败或不匹配"
   fi
+done
+if [ -z "$HY2_DOMAIN" ]; then
+  HY2_DOMAIN="${IP_DASH}.sslip.io"
+  echo "[WARN] 所有域名服务均无法正确解析。将使用 ${HY2_DOMAIN}，ACME 可能失败。"
+fi
+echo "[OK] 使用域名: ${HY2_DOMAIN}"
+
+# ===========================
+# 3) 安装 hysteria 二进制
+# ===========================
+if ! command -v hysteria >/dev/null; then
+  echo "[*] 安装 hysteria ..."
+  arch="$(uname -m)"; case "$arch" in x86_64|amd64) asset="hysteria-linux-amd64" ;; aarch64|arm64) asset="hysteria-linux-arm64" ;; *) asset="hysteria-linux-amd64" ;; esac
+  ver="$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name')"
   curl -fL "https://github.com/apernet/hysteria/releases/download/${ver}/${asset}" -o /usr/local/bin/hysteria
   chmod +x /usr/local/bin/hysteria
 fi
 
 # ===========================
-# 2) Check for or Request Certificate
+# 4) 密码生成
 # ===========================
-mkdir -p /etc/hysteria
-HY2_CONFIG_BASE="/etc/hysteria/base_config.yaml"
-HYSTERIA_CERT_BASE="/root/.config/hysteria/certs"
-ACME_BASE="$HYSTERIA_CERT_BASE"
+if [ -z "${HY2_PASS}" ]; then HY2_PASS="$(openssl rand -hex 16)"; fi
+if [ -z "${OBFS_PASS}" ]; then OBFS_PASS="$(openssl rand -hex 8)"; fi
+
+# ===========================
+# 5) 在 /acme 下扫描现有证书
+# ===========================
 USE_EXISTING_CERT=0
 USE_CERT_PATH=""
 USE_KEY_PATH=""
+ACME_CERT_DIR=""
 
-CERT_DOMAIN_PATH="$ACME_BASE/$HY2_DOMAIN"
-if [ -d "$CERT_DOMAIN_PATH" ]; then
-    FULLCHAIN_FILE=$(find "$CERT_DOMAIN_PATH" -type f -name "fullchain*" | head -n1)
-    PRIVKEY_FILE=$(find "$CERT_DOMAIN_PATH" -type f -name "*.key" -o -name "privkey*" | head -n1)
-    if [ -f "$FULLCHAIN_FILE" ] && [ -f "$PRIVKEY_FILE" ]; then
-        USE_EXISTING_CERT=1
-        USE_CERT_PATH="$FULLCHAIN_FILE"
-        USE_KEY_PATH="$PRIVKEY_FILE"
-        echo "[OK] Existing certificate found: $FULLCHAIN_FILE"
+# 尝试在 /acme (acme.sh 默认) 或 /etc/hysteria/certs (Hysteria 内置 ACME) 寻找证书
+CERT_SEARCH_PATHS=("/acme" "/etc/hysteria/certs/certs")
+for path in "${CERT_SEARCH_PATHS[@]}"; do
+    if [ -d "$path" ]; then
+        FOUND_DIR=$(find "$path" -type f -name "fullchain.pem" -exec dirname {} \; -print -quit)
+        if [ -n "$FOUND_DIR" ] && [ -f "${FOUND_DIR}/fullchain.pem" ] && ([ -f "${FOUND_DIR}/privkey.pem" ] || [ -f "${FOUND_DIR}/private.key" ]); then
+            USE_EXISTING_CERT=1
+            ACME_CERT_DIR="$FOUND_DIR"
+            USE_CERT_PATH="${ACME_CERT_DIR}/fullchain.pem"
+            # 兼容 acme.sh 的 privkey.pem 和 hysteria 的 private.key
+            if [ -f "${ACME_CERT_DIR}/privkey.pem" ]; then
+              USE_KEY_PATH="${ACME_CERT_DIR}/privkey.pem"
+            else
+              USE_KEY_PATH="${ACME_CERT_DIR}/private.key"
+            fi
+            echo "[OK] 检测到现有证书: ${USE_CERT_PATH}"
+            break
+        fi
     fi
-fi
+done
 
-if [ "$USE_EXISTING_CERT" -eq 0 ]; then
-  echo "[INFO] Certificate not found, attempting ACME HTTP-01..."
+
+# ===========================
+# 6, 7, 8) 创建 Hysteria 配置, Systemd 服务并启动
+# ===========================
+mkdir -p /etc/hysteria/certs
+
+# 6.1) 创建 Systemd 模板服务
+cat >/etc/systemd/system/hysteria-server@.service <<'SVC'
+[Unit]
+Description=Hysteria Server (Port %i)
+After=network.target
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config-%i.yaml
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl daemon-reload
+
+# 6.2) 根据证书情况，处理所有端口的配置和启动
+if [ "$USE_EXISTING_CERT" -eq 1 ]; then
+  echo "[INFO] 使用现有证书为所有端口配置..."
+  for port in "${HY2_PORTS[@]}"; do
+    echo "[*] 为端口 ${port} 生成配置文件..."
+    cat >"/etc/hysteria/config-${port}.yaml" <<EOF
+listen: :${port}
+auth: {type: password, password: ${HY2_PASS}}
+obfs: {type: salamander, salamander: {password: ${OBFS_PASS}}}
+tls: {cert: ${USE_CERT_PATH}, key: ${USE_KEY_PATH}}
+EOF
+  done
+  echo "[*] 启动所有 Hysteria 服务..."
+  for port in "${HY2_PORTS[@]}"; do systemctl enable --now "hysteria-server@${port}"; done
+else
+  PRIMARY_PORT=${HY2_PORTS[0]}
+  echo "[INFO] 未找到证书，将使用端口 ${PRIMARY_PORT} 进行 ACME 申请..."
   
-  systemctl disable --now hysteria-acme 2>/dev/null || true
-  rm -f /etc/systemd/system/hysteria-acme.service
-  
-  cat >"${HY2_CONFIG_BASE}" <<EOF
-listen: :${HY2_PORT_START}
+  # 为主端口创建ACME配置
+  cat >"/etc/hysteria/config-${PRIMARY_PORT}.yaml" <<EOF
+listen: :${PRIMARY_PORT}
+auth: {type: password, password: ${HY2_PASS}}
+obfs: {type: salamander, salamander: {password: ${OBFS_PASS}}}
 acme:
   domains:
     - ${HY2_DOMAIN}
+  email: user@example.com
+  storage: /etc/hysteria/certs
   disable_http_challenge: false
   disable_tlsalpn_challenge: true
-auth:
-  type: password
-  password: acme_temp_pass
-obfs:
-  type: salamander
-  salamander:
-    password: acme_temp_obfs
 EOF
 
-  cat >/etc/systemd/system/hysteria-acme.service <<'SVC'
-[Unit]
-Description=Hysteria ACME Client (Temp)
-After=network.target
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/base_config.yaml
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-SVC
-  systemctl daemon-reload
-  systemctl enable --now hysteria-acme
+  # 仅启动主服务
+  echo "[*] 启动主服务 (hysteria-server@${PRIMARY_PORT}) 以申请证书..."
+  systemctl enable --now "hysteria-server@${PRIMARY_PORT}"
   
+  # 等待ACME完成
+  echo "[*] 等待 ACME 证书申请完成（最多 90 秒）..."
   TRIES=0; ACME_OK=0
-  echo "[*] Waiting for ACME certificate acquisition (up to 60 seconds)..."
-  while [ $TRIES -lt 12 ]; do
-    if journalctl -u hysteria-acme --no-pager -n 200 | grep -E -iq "certificate obtained successfully"; then
-      ACME_OK=1
-      break
+  while [ $TRIES -lt 18 ]; do
+    if journalctl -u "hysteria-server@${PRIMARY_PORT}" --no-pager -n 100 | grep -q "acme: certificate obtained successfully"; then
+      ACME_OK=1; break
     fi
-    sleep 5
-    TRIES=$((TRIES+1))
+    if journalctl -u "hysteria-server@${PRIMARY_PORT}" --no-pager -n 200 | grep -q "rateLimited"; then
+      echo "[ERROR] 检测到 ACME 速率限制。请等待后再试。" >&2; exit 1
+    fi
+    sleep 5; TRIES=$((TRIES+1))
   done
-  
-  systemctl disable --now hysteria-acme 2>/dev/null || true
-  rm -f /etc/systemd/system/hysteria-acme.service
-  
-  if [ "$ACME_OK" -ne 1 ]; then
-    echo "[ERROR] ACME certificate acquisition failed or timed out. Check if port 80 is open to the public!"
-    exit 1
-  fi
-  echo "[OK] ACME certificate acquired successfully."
 
-  CERT_DOMAIN_PATH="$ACME_BASE/$HY2_DOMAIN"
-  FULLCHAIN_FILE=$(find "$CERT_DOMAIN_PATH" -type f -name "fullchain*" | head -n1)
-  PRIVKEY_FILE=$(find "$CERT_DOMAIN_PATH" -type f -name "*.key" -o -name "privkey*" | head -n1)
-  if [ -f "$FULLCHAIN_FILE" ] && [ -f "$PRIVKEY_FILE" ]; then
-      USE_EXISTING_CERT=1
-      USE_CERT_PATH="$FULLCHAIN_FILE"
-      USE_KEY_PATH="$PRIVKEY_FILE"
-  else
-      echo "[ERR] Certificate was acquired but files not found in $CERT_DOMAIN_PATH. Exiting."
-      exit 1
-  fi
+  if [ "$ACME_OK" -ne 1 ]; then echo "[ERROR] ACME 证书申请失败，请检查日志: journalctl -u hysteria-server@${PRIMARY_PORT}" >&2; exit 1; fi
+  
+  echo "[OK] ACME 证书申请成功！"
+  USE_CERT_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/fullchain.pem"
+  USE_KEY_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/private.key"
+
+  # 为其他端口创建配置并启动
+  echo "[*] 为其余端口配置并启动服务..."
+  for port in "${HY2_PORTS[@]}"; do
+    if [ "$port" -eq "$PRIMARY_PORT" ]; then continue; fi
+    echo "[*] 为端口 ${port} 生成配置文件..."
+    cat >"/etc/hysteria/config-${port}.yaml" <<EOF
+listen: :${port}
+auth: {type: password, password: ${HY2_PASS}}
+obfs: {type: salamander, salamander: {password: ${OBFS_PASS}}}
+tls: {cert: ${USE_CERT_PATH}, key: ${USE_KEY_PATH}}
+EOF
+    echo "[*] 启动 hysteria-server@${port} 服务..."
+    systemctl enable --now "hysteria-server@${port}"
+  done
 fi
 
+sleep 3
+setup_auto_reboot_cron
+
+LISTEN_PORTS_GREP=$(IFS="|"; echo "${HY2_PORTS[*]}")
+echo "=== 监听检查 (UDP/${LISTEN_PORTS_GREP}) ==="
+ss -lunp | grep -E ":(${LISTEN_PORTS_GREP})\b" || echo "[WARN] 未在 ss 中检测到所有监听端口。"
+
 # ===========================
-# 3) Loop Deploy Hysteria 2 Nodes
+# 9, 10) 构造 URI 和 Clash 订阅
 # ===========================
-echo
-echo "=== Starting deployment of ${COUNT} Hysteria 2 instances ==="
-for ((i = 1; i <= COUNT; i++)); do
-  HY2_PORT=$((HY2_PORT_START + i - 1))
-  SERVICE_NAME="hysteria-server-${i}"
-  CONFIG_PATH="/etc/hysteria/config_${i}.yaml"
-  YAML_PATH="${CLASH_WEB_DIR}/clash_subscription_${i}.yaml"
-  NAME_TAG="${NAME_TAG_BASE}${i}"
+echo -e "\n============================================================"
+echo "=========== Hysteria2 配置信息 (共 ${#HY2_PORTS[@]} 个) ==========="
+echo "============================================================"
 
-  HY2_PASS="$(openssl rand -hex 16)"
-  OBFS_PASS="$(openssl rand -hex 8)"
-  echo "[$i/$COUNT] Deploying node: Port ${HY2_PORT}, Service ${SERVICE_NAME}"
+PASS_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "$HY2_PASS")"
+OBFS_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "$OBFS_PASS")"
+PIN_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "${PIN_SHA256:-}")"
 
-  cat >"${CONFIG_PATH}" <<EOF
-listen: :${HY2_PORT}
-auth:
-  type: password
-  password: ${HY2_PASS}
-obfs:
-  type: salamander
-  salamander:
-    password: ${OBFS_PASS}
-tls:
-  cert: ${USE_CERT_PATH}
-  key: ${USE_KEY_PATH}
-EOF
-  echo "  - Config written: ${CONFIG_PATH}"
-
-  cat >/etc/systemd/system/"${SERVICE_NAME}".service <<SVC
-[Unit]
-Description=Hysteria Server ${i}
-After=network.target
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/hysteria server -c ${CONFIG_PATH}
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-SVC
-  systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}"
-  echo "  - Service started: ${SERVICE_NAME}"
-
-  PASS_ENC="$(python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$HY2_PASS")"
-  OBFS_ENC="$(python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$OBFS_PASS")"
-  NAME_ENC="$(python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$NAME_TAG")"
-  URI_i="hysteria2://${PASS_ENC}@${SELECTED_IP}:${HY2_PORT}/?protocol=udp&obfs=salamander&obfs-password=${OBFS_ENC}&sni=${HY2_DOMAIN}&insecure=0#${NAME_ENC}"
-  
-  echo "  - URI: ${URI_i}"
-
-  cat > "${YAML_PATH}.tmp" <<'EOF'
+CLASH_TEMPLATE=$(cat <<'EOF'
 mixed-port: 7890
 allow-lan: true
-bind-address: '*'
 mode: rule
 log-level: info
-external-controller: '127.0.0.1:9090'
-dns:
-  enable: true
-  ipv6: false
-  default-nameserver: [223.5.5.5, 8.8.8.8]
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  nameserver: [https://doh.pub/dns-query, https://dns.alidns.com/dns-query]
+external-controller: 127.0.0.1:9090
+dns: {enable: true, ipv6: false, default-nameserver: [223.5.5.5, 8.8.8.8], enhanced-mode: fake-ip, fake-ip-range: 198.18.0.1/16, nameserver: [https://doh.pub/dns-query, https://dns.alidns.com/dns-query]}
 proxies:
-  - name: "__NAME_TAG__"
-    type: hysteria2
-    server: __SELECTED_IP__
-    port: __HY2_PORT__
-    password: __HY2_PASS__
-    obfs: salamander
-    obfs-password: __OBFS_PASS__
-    sni: __HY2_DOMAIN__
+  - {name: "__NAME_TAG__", type: hysteria2, server: __SELECTED_IP__, port: __HY2_PORT__, password: __HY2_PASS__, obfs: salamander, obfs-password: __OBFS_PASS__, sni: __HY2_DOMAIN__}
 proxy-groups:
-  - name: "🚀 Node Selection"
-    type: select
-    proxies: ["__NAME_TAG__", DIRECT]
+  - {name: "🚀 节点选择", type: select, proxies: ["__NAME_TAG__", DIRECT]}
 rules:
   - DOMAIN-SUFFIX,cn,DIRECT
-  - DOMAIN-KEYWORD,baidu,DIRECT
-  - DOMAIN-KEYWORD,taobao,DIRECT
-  - DOMAIN-KEYWORD,qq,DIRECT
-  - DOMAIN-KEYWORD,weixin,DIRECT
-  - DOMAIN-KEYWORD,alipay,DIRECT
   - GEOIP,CN,DIRECT
-  - MATCH,🚀 Node Selection
+  - MATCH,🚀 节点选择
 EOF
+)
 
-  TMPF="${YAML_PATH}.tmp"
-  TARGET="${YAML_PATH}"
+for port in "${HY2_PORTS[@]}"; do
+  CURRENT_NAME_TAG="${NAME_TAG}-${port}"
+  NAME_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "$CURRENT_NAME_TAG")"
   
-  NAME_ESC="$(escape_for_sed "${NAME_TAG}")"
+  URI="hysteria2://${PASS_ENC}@${SELECTED_IP}:${port}/?protocol=udp&obfs=salamander&obfs-password=${OBFS_ENC}&sni=${HY2_DOMAIN}&insecure=0&pinSHA256=${PIN_ENC}#${NAME_ENC}"
+  
+  echo -e "\n--- 端口: ${port} ---"
+  echo "Hysteria2 URI: ${URI}"
+  
+  TARGET_CLASH_FILE="${CLASH_WEB_DIR}/clash_sub_${port}.yaml"
+  
+  NAME_ESC="$(escape_for_sed "${CURRENT_NAME_TAG}")"
   IP_ESC="$(escape_for_sed "${SELECTED_IP}")"
-  PORT_ESC="$(escape_for_sed "${HY2_PORT}")"
+  PORT_ESC="$(escape_for_sed "${port}")"
   PASS_ESC="$(escape_for_sed "${HY2_PASS}")"
   OBFS_ESC="$(escape_for_sed "${OBFS_PASS}")"
   DOMAIN_ESC="$(escape_for_sed "${HY2_DOMAIN}")"
-  
-  sed -e "s@__NAME_TAG__@${NAME_ESC}@g" \
-      -e "s@__SELECTED_IP__@${IP_ESC}@g" \
-      -e "s@__HY2_PORT__@${PORT_ESC}@g" \
-      -e "s@__HY2_PASS__@${PASS_ESC}@g" \
-      -e "s@__OBFS_PASS__@${OBFS_ESC}@g" \
-      -e "s@__HY2_DOMAIN__@${DOMAIN_ESC}@g" \
-      "${TMPF}" > "${TARGET}"
-  rm -f "${TMPF}"
-  
-  echo "  - Clash subscription generated: ${TARGET}"
-  echo
+
+  echo "$CLASH_TEMPLATE" | \
+    sed -e "s@__NAME_TAG__@${NAME_ESC}@g" -e "s@__SELECTED_IP__@${IP_ESC}@g" \
+        -e "s@__HY2_PORT__@${PORT_ESC}@g" -e "s@__HY2_PASS__@${PASS_ESC}@g" \
+        -e "s@__OBFS_PASS__@${OBFS_ESC}@g" -e "s@__HY2_DOMAIN__@${DOMAIN_ESC}@g" > "${TARGET_CLASH_FILE}"
+        
+  echo "Clash 订阅: http://${SELECTED_IP}:${HTTP_PORT}/clash/${port}.yaml"
 done
 
 # ===========================
-# 4) Configure Nginx for Subscription
+# 11) 配置 nginx 提供订阅
 # ===========================
+echo -e "\n[*] 配置 nginx 提供 Clash 订阅..."
 cat >/etc/nginx/sites-available/clash.conf <<EOF
 server {
     listen ${HTTP_PORT} default_server;
     listen [::]:${HTTP_PORT} default_server;
     root ${CLASH_WEB_DIR};
-    location ~ /clash_subscription_[0-9]+\.yaml$ {
+    index index.html;
+    location ~ ^/clash/(\d+)\.yaml$ {
         default_type application/x-yaml;
-        try_files \$uri =404;
+        try_files /clash_sub_\$1.yaml =404;
+    }
+    location = / {
+        default_type text/html;
+        return 200 '<html><head><title>Clash Subscriptions</title></head><body><h1>Hysteria2 Clash Subscriptions</h1><ul><li><a href="http://${SELECTED_IP}:${HTTP_PORT}/clash/20000.yaml">Port 20000</a></li><li><a href="http://${SELECTED_IP}:${HTTP_PORT}/clash/20001.yaml">Port 20001</a></li><li><a href="http://${SELECTED_IP}:${HTTP_PORT}/clash/20002.yaml">Port 20002</a></li><li><a href="http://${SELECTED_IP}:${HTTP_PORT}/clash/20003.yaml">Port 20003</a></li><li><a href="http://${SELECTED_IP}:${HTTP_PORT}/clash/20004.yaml">Port 20004</a></li></ul></body></html>';
     }
     access_log /var/log/nginx/clash_access.log;
     error_log /var/log/nginx/clash_error.log;
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/clash.conf /etc/nginx/sites-enabled/clash.conf 2>/dev/null || true
-nginx -t
-systemctl restart nginx
+if [ -L /etc/nginx/sites-enabled/default ]; then
+    echo "[INFO] 删除默认 Nginx 站点以避免端口冲突..."
+    rm -f /etc/nginx/sites-enabled/default
+fi
+ln -sf /etc/nginx/sites-available/clash.conf /etc/nginx/sites-enabled/clash.conf
+if nginx -t; then
+  systemctl restart nginx
+else
+  echo "[ERROR] Nginx 配置测试失败: nginx -t" >&2; exit 1
+fi
 
-echo "================================================="
-echo "✅ Deployment successful! ${COUNT} Hysteria 2 nodes generated."
-echo "================================================="
-echo "All nodes share the same certificate and domain: ${HY2_DOMAIN}"
-echo "Nginx subscription service port: ${HTTP_PORT}"
-echo "-------------------------------------------------"
-for ((i = 1; i <= COUNT; i++)); do
-  HY2_PORT=$((HY2_PORT_START + i - 1))
-  echo "🚀 Node ${i} (Port ${HY2_PORT}) subscription link:"
-  echo "    http://${SELECTED_IP}:${HTTP_PORT}/clash_subscription_${i}.yaml"
-done
-echo "-------------------------------------------------"
+echo -e "\n============================================================"
+echo "[OK] 所有服务已配置完毕！"
+echo "您可以访问 http://${SELECTED_IP}:${HTTP_PORT}/ 来查看所有订阅链接。"
+echo "============================================================"
