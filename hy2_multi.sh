@@ -50,6 +50,7 @@ setup_auto_reboot_cron() {
 # ===========================
 SCRIPT_MODE="${SCRIPT_MODE:-}"
 if [ -z "$SCRIPT_MODE" ] && [ -t 0 ]; then
+  # 接收用户输入，y/Y/1 都视为模式1
   read -r -p "请选择模式: 1) 全新安装  2) 仅添加每天自动清缓存+硬重启 [默认1]: " SCRIPT_MODE || true
 fi
 case "${SCRIPT_MODE}" in
@@ -58,37 +59,24 @@ case "${SCRIPT_MODE}" in
 esac
 
 # ===========================
-# 0) 获取公网 IPv4
+# 0) 获取公网 IPv4 (已优化，可适应内网/公网环境)
 # ===========================
-# ===========================
-# 0) 获取公网 IPv4
-# ===========================
+echo "[*] 正在检测 IP 地址..."
 # 优先尝试从本机网络接口获取
 LOCAL_IP="$(ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)"
-
-# 检查获取到的 IP 是否为内网 IP
-# 内网 IP 范围: 10.x.x.x, 172.16.x.x-172.31.x.x, 192.168.x.x
 IS_PRIVATE=0
 case "${LOCAL_IP}" in
-    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
-        IS_PRIVATE=1
-        ;;
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) IS_PRIVATE=1 ;;
 esac
-
-# 如果本地获取的是内网IP，或者没获取到，则通过外部服务获取公网IP
 if [ "$IS_PRIVATE" -eq 1 ] || [ -z "$LOCAL_IP" ]; then
     echo "[INFO] 本地IP (${LOCAL_IP:-"未找到"}) 为内网IP，尝试从外部服务获取公网IP..."
-    # 使用 curl 从多个可靠的服务轮流尝试，确保成功率
-    SELECTED_IP=$(curl -s4 ifconfig.me || curl -s4 api.ipify.org || curl -s4 ip.sb)
+    SELECTED_IP=$(curl -s4 --connect-timeout 5 ifconfig.me || curl -s4 --connect-timeout 5 api.ipify.org || curl -s4 --connect-timeout 5 ip.sb)
 else
     echo "[INFO] 本地检测到公网IP: ${LOCAL_IP}"
     SELECTED_IP="$LOCAL_IP"
 fi
-
-# 最终检查，如果还是没有IP，则脚本退出
 if [ -z "${SELECTED_IP}" ]; then
-  echo "[ERR] 无法通过任何方式获取到有效的公网 IPv4 地址，脚本退出。" >&2
-  exit 1
+  echo "[ERR] 无法通过任何方式获取到有效的公网 IPv4 地址，脚本退出。" >&2; exit 1
 fi
 echo "[OK] 确认使用公网 IP: ${SELECTED_IP}"
 
@@ -97,8 +85,16 @@ echo "[OK] 确认使用公网 IP: ${SELECTED_IP}"
 # 1) 安装依赖
 # ===========================
 export DEBIAN_FRONTEND=noninteractive
-pkgs=(curl jq openssl python3 nginx)
-if ! dpkg -s "${pkgs[@]}" >/dev/null 2>&1; then
+pkgs=(curl jq openssl python3 nginx systemd)
+# 检查 systemd-journald 是否需要单独处理
+if ! command -v journalctl >/dev/null; then pkgs+=(systemd-container); fi
+
+NEEDS_INSTALL=0
+for p in "${pkgs[@]}"; do
+  if ! dpkg -s "$p" >/dev/null 2>&1; then NEEDS_INSTALL=1; break; fi
+done
+if [ "$NEEDS_INSTALL" -eq 1 ]; then
+  echo "[*] 正在安装缺失的依赖包..."
   apt-get update -y && apt-get install -y "${pkgs[@]}"
 fi
 
@@ -146,32 +142,20 @@ if [ -z "${OBFS_PASS}" ]; then OBFS_PASS="$(openssl rand -hex 8)"; fi
 # ===========================
 # 5) 在 /acme 下扫描现有证书
 # ===========================
-USE_EXISTING_CERT=0
-USE_CERT_PATH=""
-USE_KEY_PATH=""
-ACME_CERT_DIR=""
-
-# 尝试在 /acme (acme.sh 默认) 或 /etc/hysteria/certs (Hysteria 内置 ACME) 寻找证书
+USE_EXISTING_CERT=0; USE_CERT_PATH=""; USE_KEY_PATH=""
 CERT_SEARCH_PATHS=("/acme" "/etc/hysteria/certs/certs")
 for path in "${CERT_SEARCH_PATHS[@]}"; do
     if [ -d "$path" ]; then
         FOUND_DIR=$(find "$path" -type f -name "fullchain.pem" -exec dirname {} \; -print -quit)
         if [ -n "$FOUND_DIR" ] && [ -f "${FOUND_DIR}/fullchain.pem" ] && ([ -f "${FOUND_DIR}/privkey.pem" ] || [ -f "${FOUND_DIR}/private.key" ]); then
             USE_EXISTING_CERT=1
-            ACME_CERT_DIR="$FOUND_DIR"
-            USE_CERT_PATH="${ACME_CERT_DIR}/fullchain.pem"
-            # 兼容 acme.sh 的 privkey.pem 和 hysteria 的 private.key
-            if [ -f "${ACME_CERT_DIR}/privkey.pem" ]; then
-              USE_KEY_PATH="${ACME_CERT_DIR}/privkey.pem"
-            else
-              USE_KEY_PATH="${ACME_CERT_DIR}/private.key"
-            fi
+            USE_CERT_PATH="${FOUND_DIR}/fullchain.pem"
+            if [ -f "${FOUND_DIR}/privkey.pem" ]; then USE_KEY_PATH="${FOUND_DIR}/privkey.pem"; else USE_KEY_PATH="${FOUND_DIR}/private.key"; fi
             echo "[OK] 检测到现有证书: ${USE_CERT_PATH}"
             break
         fi
     fi
 done
-
 
 # ===========================
 # 6, 7, 8) 创建 Hysteria 配置, Systemd 服务并启动
@@ -213,33 +197,39 @@ else
   PRIMARY_PORT=${HY2_PORTS[0]}
   echo "[INFO] 未找到证书，将使用端口 ${PRIMARY_PORT} 进行 ACME 申请..."
   
-  # 为主端口创建ACME配置
   cat >"/etc/hysteria/config-${PRIMARY_PORT}.yaml" <<EOF
 listen: :${PRIMARY_PORT}
 auth: {type: password, password: ${HY2_PASS}}
 obfs: {type: salamander, salamander: {password: ${OBFS_PASS}}}
 acme:
-  domains:
-    - ${HY2_DOMAIN}
+  domains: [- ${HY2_DOMAIN}]
   email: user@example.com
   storage: /etc/hysteria/certs
   disable_http_challenge: false
   disable_tlsalpn_challenge: true
 EOF
 
-  # 仅启动主服务
+  # 【关键改进】确保日志服务可用
+  echo "[*] 正在检查并确保日志服务 (journald) 正常运行..."
+  mkdir -p /var/log/journal && systemctl restart systemd-journald
+  sleep 2
+
   echo "[*] 启动主服务 (hysteria-server@${PRIMARY_PORT}) 以申请证书..."
   systemctl enable --now "hysteria-server@${PRIMARY_PORT}"
   
-  # 等待ACME完成
   echo "[*] 等待 ACME 证书申请完成（最多 90 秒）..."
-  TRIES=0; ACME_OK=0
+  TRIES=0; ACME_OK=0; CERT_FILE="/etc/hysteria/certs/certs/${HY2_DOMAIN}/fullchain.pem"
+  
   while [ $TRIES -lt 18 ]; do
-    if journalctl -u "hysteria-server@${PRIMARY_PORT}" --no-pager -n 100 | grep -q "acme: certificate obtained successfully"; then
+    # 【关键改进】方法一：检查日志
+    if journalctl -u "hysteria-server@${PRIMARY_PORT}" --no-pager --since "5 minutes ago" | grep -iq "acme: certificate obtained successfully"; then
+      echo "[INFO] 在日志中检测到证书申请成功！"
       ACME_OK=1; break
     fi
-    if journalctl -u "hysteria-server@${PRIMARY_PORT}" --no-pager -n 200 | grep -q "rateLimited"; then
-      echo "[ERROR] 检测到 ACME 速率限制。请等待后再试。" >&2; exit 1
+    # 【关键改进】方法二：检查证书文件是否已生成（更可靠）
+    if [ -f "$CERT_FILE" ]; then
+      echo "[INFO] 检测到证书文件已生成！"
+      ACME_OK=1; break
     fi
     sleep 5; TRIES=$((TRIES+1))
   done
@@ -250,18 +240,15 @@ EOF
   USE_CERT_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/fullchain.pem"
   USE_KEY_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/private.key"
 
-  # 为其他端口创建配置并启动
   echo "[*] 为其余端口配置并启动服务..."
   for port in "${HY2_PORTS[@]}"; do
     if [ "$port" -eq "$PRIMARY_PORT" ]; then continue; fi
-    echo "[*] 为端口 ${port} 生成配置文件..."
     cat >"/etc/hysteria/config-${port}.yaml" <<EOF
 listen: :${port}
 auth: {type: password, password: ${HY2_PASS}}
 obfs: {type: salamander, salamander: {password: ${OBFS_PASS}}}
 tls: {cert: ${USE_CERT_PATH}, key: ${USE_KEY_PATH}}
 EOF
-    echo "[*] 启动 hysteria-server@${port} 服务..."
     systemctl enable --now "hysteria-server@${port}"
   done
 fi
@@ -366,3 +353,4 @@ echo -e "\n============================================================"
 echo "[OK] 所有服务已配置完毕！"
 echo "您可以访问 http://${SELECTED_IP}:${HTTP_PORT}/ 来查看所有订阅链接。"
 echo "============================================================"
+
