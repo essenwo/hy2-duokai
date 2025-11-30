@@ -85,10 +85,8 @@ echo "[OK] 确认使用公网 IP: ${SELECTED_IP}"
 # 1) 安装依赖
 # ===========================
 export DEBIAN_FRONTEND=noninteractive
+# 适配极简系统，确保 systemd-journald 存在
 pkgs=(curl jq openssl python3 nginx systemd)
-# 检查 systemd-journald 是否需要单独处理
-if ! command -v journalctl >/dev/null; then pkgs+=(systemd-container); fi
-
 NEEDS_INSTALL=0
 for p in "${pkgs[@]}"; do
   if ! dpkg -s "$p" >/dev/null 2>&1; then NEEDS_INSTALL=1; break; fi
@@ -211,7 +209,8 @@ EOF
 
   # 【关键改进】确保日志服务可用
   echo "[*] 正在检查并确保日志服务 (journald) 正常运行..."
-  mkdir -p /var/log/journal && systemctl restart systemd-journald
+  mkdir -p /var/log/journal
+  systemctl restart systemd-journald
   sleep 2
 
   echo "[*] 启动主服务 (hysteria-server@${PRIMARY_PORT}) 以申请证书..."
@@ -234,7 +233,10 @@ EOF
     sleep 5; TRIES=$((TRIES+1))
   done
 
-  if [ "$ACME_OK" -ne 1 ]; then echo "[ERROR] ACME 证书申请失败，请检查日志: journalctl -u hysteria-server@${PRIMARY_PORT}" >&2; exit 1; fi
+  if [ "$ACME_OK" -ne 1 ]; then 
+    echo "[ERROR] ACME 证书申请失败，请检查日志: journalctl -u hysteria-server@${PRIMARY_PORT}" >&2
+    exit 1
+  fi
   
   echo "[OK] ACME 证书申请成功！"
   USE_CERT_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/fullchain.pem"
@@ -263,14 +265,13 @@ ss -lunp | grep -E ":(${LISTEN_PORTS_GREP})\b" || echo "[WARN] 未在 ss 中检�
 # ===========================
 # 9, 10) 构造 URI 和 Clash 订阅
 # ===========================
+# ... (这部分代码无需修改，保持原样即可)
 echo -e "\n============================================================"
 echo "=========== Hysteria2 配置信息 (共 ${#HY2_PORTS[@]} 个) ==========="
 echo "============================================================"
-
 PASS_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "$HY2_PASS")"
 OBFS_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "$OBFS_PASS")"
 PIN_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "${PIN_SHA256:-}")"
-
 CLASH_TEMPLATE=$(cat <<'EOF'
 mixed-port: 7890
 allow-lan: true
@@ -288,36 +289,30 @@ rules:
   - MATCH,🚀 节点选择
 EOF
 )
-
 for port in "${HY2_PORTS[@]}"; do
   CURRENT_NAME_TAG="${NAME_TAG}-${port}"
   NAME_ENC="$(python3 -c "import urllib.parse as u, sys; print(u.quote(sys.argv[1]))" "$CURRENT_NAME_TAG")"
-  
   URI="hysteria2://${PASS_ENC}@${SELECTED_IP}:${port}/?protocol=udp&obfs=salamander&obfs-password=${OBFS_ENC}&sni=${HY2_DOMAIN}&insecure=0&pinSHA256=${PIN_ENC}#${NAME_ENC}"
-  
   echo -e "\n--- 端口: ${port} ---"
   echo "Hysteria2 URI: ${URI}"
-  
   TARGET_CLASH_FILE="${CLASH_WEB_DIR}/clash_sub_${port}.yaml"
-  
   NAME_ESC="$(escape_for_sed "${CURRENT_NAME_TAG}")"
   IP_ESC="$(escape_for_sed "${SELECTED_IP}")"
   PORT_ESC="$(escape_for_sed "${port}")"
   PASS_ESC="$(escape_for_sed "${HY2_PASS}")"
   OBFS_ESC="$(escape_for_sed "${OBFS_PASS}")"
   DOMAIN_ESC="$(escape_for_sed "${HY2_DOMAIN}")"
-
   echo "$CLASH_TEMPLATE" | \
     sed -e "s@__NAME_TAG__@${NAME_ESC}@g" -e "s@__SELECTED_IP__@${IP_ESC}@g" \
         -e "s@__HY2_PORT__@${PORT_ESC}@g" -e "s@__HY2_PASS__@${PASS_ESC}@g" \
         -e "s@__OBFS_PASS__@${OBFS_ESC}@g" -e "s@__HY2_DOMAIN__@${DOMAIN_ESC}@g" > "${TARGET_CLASH_FILE}"
-        
   echo "Clash 订阅: http://${SELECTED_IP}:${HTTP_PORT}/clash/${port}.yaml"
 done
 
 # ===========================
 # 11) 配置 nginx 提供订阅
 # ===========================
+# ... (这部分代码无需修改，保持原样即可)
 echo -e "\n[*] 配置 nginx 提供 Clash 订阅..."
 cat >/etc/nginx/sites-available/clash.conf <<EOF
 server {
@@ -337,7 +332,6 @@ server {
     error_log /var/log/nginx/clash_error.log;
 }
 EOF
-
 if [ -L /etc/nginx/sites-enabled/default ]; then
     echo "[INFO] 删除默认 Nginx 站点以避免端口冲突..."
     rm -f /etc/nginx/sites-enabled/default
@@ -348,7 +342,6 @@ if nginx -t; then
 else
   echo "[ERROR] Nginx 配置测试失败: nginx -t" >&2; exit 1
 fi
-
 echo -e "\n============================================================"
 echo "[OK] 所有服务已配置完毕！"
 echo "您可以访问 http://${SELECTED_IP}:${HTTP_PORT}/ 来查看所有订阅链接。"
