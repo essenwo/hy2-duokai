@@ -50,7 +50,6 @@ setup_auto_reboot_cron() {
 # ===========================
 SCRIPT_MODE="${SCRIPT_MODE:-}"
 if [ -z "$SCRIPT_MODE" ] && [ -t 0 ]; then
-  # 接收用户输入，y/Y/1 都视为模式1
   read -r -p "请选择模式: 1) 全新安装  2) 仅添加每天自动清缓存+硬重启 [默认1]: " SCRIPT_MODE || true
 fi
 case "${SCRIPT_MODE}" in
@@ -59,10 +58,9 @@ case "${SCRIPT_MODE}" in
 esac
 
 # ===========================
-# 0) 获取公网 IPv4 (已优化，可适应内网/公网环境)
+# 0) 获取公网 IPv4 (已优化)
 # ===========================
 echo "[*] 正在检测 IP 地址..."
-# 优先尝试从本机网络接口获取
 LOCAL_IP="$(ip -4 addr show scope global | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true)"
 IS_PRIVATE=0
 case "${LOCAL_IP}" in
@@ -72,7 +70,6 @@ if [ "$IS_PRIVATE" -eq 1 ] || [ -z "$LOCAL_IP" ]; then
     echo "[INFO] 本地IP (${LOCAL_IP:-"未找到"}) 为内网IP，尝试从外部服务获取公网IP..."
     SELECTED_IP=$(curl -s4 --connect-timeout 5 ifconfig.me || curl -s4 --connect-timeout 5 api.ipify.org || curl -s4 --connect-timeout 5 ip.sb)
 else
-    echo "[INFO] 本地检测到公网IP: ${LOCAL_IP}"
     SELECTED_IP="$LOCAL_IP"
 fi
 if [ -z "${SELECTED_IP}" ]; then
@@ -85,7 +82,6 @@ echo "[OK] 确认使用公网 IP: ${SELECTED_IP}"
 # 1) 安装依赖
 # ===========================
 export DEBIAN_FRONTEND=noninteractive
-# 适配极简系统，确保 systemd-journald 存在
 pkgs=(curl jq openssl python3 nginx systemd)
 NEEDS_INSTALL=0
 for p in "${pkgs[@]}"; do
@@ -110,8 +106,6 @@ for service in "${DOMAIN_SERVICES[@]}"; do
     HY2_DOMAIN="$test_domain"
     echo "[OK] ${service} 解析正常: ${test_domain}"
     break
-  else
-    echo "[WARN] ${service} 解析失败或不匹配"
   fi
 done
 if [ -z "$HY2_DOMAIN" ]; then
@@ -125,7 +119,7 @@ echo "[OK] 使用域名: ${HY2_DOMAIN}"
 # ===========================
 if ! command -v hysteria >/dev/null; then
   echo "[*] 安装 hysteria ..."
-  arch="$(uname -m)"; case "$arch" in x86_64|amd64) asset="hysteria-linux-amd64" ;; aarch64|arm64) asset="hysteria-linux-arm64" ;; *) asset="hysteria-linux-amd64" ;; esac
+  arch="$(uname -m)"; case "$arch" in x86_64|amd64) asset="hysteria-linux-amd64" ;; aarch64|arm64) asset="hysteria-linux-arm64" ;; esac
   ver="$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name')"
   curl -fL "https://github.com/apernet/hysteria/releases/download/${ver}/${asset}" -o /usr/local/bin/hysteria
   chmod +x /usr/local/bin/hysteria
@@ -160,7 +154,6 @@ done
 # ===========================
 mkdir -p /etc/hysteria/certs
 
-# 6.1) 创建 Systemd 模板服务
 cat >/etc/systemd/system/hysteria-server@.service <<'SVC'
 [Unit]
 Description=Hysteria Server (Port %i)
@@ -177,11 +170,9 @@ WantedBy=multi-user.target
 SVC
 systemctl daemon-reload
 
-# 6.2) 根据证书情况，处理所有端口的配置和启动
 if [ "$USE_EXISTING_CERT" -eq 1 ]; then
   echo "[INFO] 使用现有证书为所有端口配置..."
   for port in "${HY2_PORTS[@]}"; do
-    echo "[*] 为端口 ${port} 生成配置文件..."
     cat >"/etc/hysteria/config-${port}.yaml" <<EOF
 listen: :${port}
 auth: {type: password, password: ${HY2_PASS}}
@@ -189,7 +180,6 @@ obfs: {type: salamander, salamander: {password: ${OBFS_PASS}}}
 tls: {cert: ${USE_CERT_PATH}, key: ${USE_KEY_PATH}}
 EOF
   done
-  echo "[*] 启动所有 Hysteria 服务..."
   for port in "${HY2_PORTS[@]}"; do systemctl enable --now "hysteria-server@${port}"; done
 else
   PRIMARY_PORT=${HY2_PORTS[0]}
@@ -207,10 +197,14 @@ acme:
   disable_tlsalpn_challenge: true
 EOF
 
-  # 【关键改进】确保日志服务可用
   echo "[*] 正在检查并确保日志服务 (journald) 正常运行..."
   mkdir -p /var/log/journal
   systemctl restart systemd-journald
+  sleep 2
+
+  # 【关键修正】在启动 Hysteria ACME 之前，临时停止 Nginx 以释放 80 端口
+  echo "[*] 临时停止 Nginx 服务以释放 80 端口用于 ACME 验证..."
+  systemctl stop nginx || true
   sleep 2
 
   echo "[*] 启动主服务 (hysteria-server@${PRIMARY_PORT}) 以申请证书..."
@@ -220,12 +214,10 @@ EOF
   TRIES=0; ACME_OK=0; CERT_FILE="/etc/hysteria/certs/certs/${HY2_DOMAIN}/fullchain.pem"
   
   while [ $TRIES -lt 18 ]; do
-    # 【关键改进】方法一：检查日志
     if journalctl -u "hysteria-server@${PRIMARY_PORT}" --no-pager --since "5 minutes ago" | grep -iq "acme: certificate obtained successfully"; then
       echo "[INFO] 在日志中检测到证书申请成功！"
       ACME_OK=1; break
     fi
-    # 【关键改进】方法二：检查证书文件是否已生成（更可靠）
     if [ -f "$CERT_FILE" ]; then
       echo "[INFO] 检测到证书文件已生成！"
       ACME_OK=1; break
@@ -242,9 +234,11 @@ EOF
   USE_CERT_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/fullchain.pem"
   USE_KEY_PATH="/etc/hysteria/certs/certs/${HY2_DOMAIN}/private.key"
 
-  echo "[*] 为其余端口配置并启动服务..."
+  # 证书申请完，立刻停止主 Hysteria 服务，后续会用新的、仅含TLS的配置重启
+  systemctl stop "hysteria-server@${PRIMARY_PORT}"
+
+  echo "[*] 为所有端口配置并启动服务..."
   for port in "${HY2_PORTS[@]}"; do
-    if [ "$port" -eq "$PRIMARY_PORT" ]; then continue; fi
     cat >"/etc/hysteria/config-${port}.yaml" <<EOF
 listen: :${port}
 auth: {type: password, password: ${HY2_PASS}}
@@ -265,7 +259,6 @@ ss -lunp | grep -E ":(${LISTEN_PORTS_GREP})\b" || echo "[WARN] 未在 ss 中检�
 # ===========================
 # 9, 10) 构造 URI 和 Clash 订阅
 # ===========================
-# ... (这部分代码无需修改，保持原样即可)
 echo -e "\n============================================================"
 echo "=========== Hysteria2 配置信息 (共 ${#HY2_PORTS[@]} 个) ==========="
 echo "============================================================"
@@ -312,7 +305,6 @@ done
 # ===========================
 # 11) 配置 nginx 提供订阅
 # ===========================
-# ... (这部分代码无需修改，保持原样即可)
 echo -e "\n[*] 配置 nginx 提供 Clash 订阅..."
 cat >/etc/nginx/sites-available/clash.conf <<EOF
 server {
@@ -333,10 +325,10 @@ server {
 }
 EOF
 if [ -L /etc/nginx/sites-enabled/default ]; then
-    echo "[INFO] 删除默认 Nginx 站点以避免端口冲突..."
     rm -f /etc/nginx/sites-enabled/default
 fi
 ln -sf /etc/nginx/sites-available/clash.conf /etc/nginx/sites-enabled/clash.conf
+echo "[*] 正在重启 Nginx 服务..."
 if nginx -t; then
   systemctl restart nginx
 else
@@ -346,4 +338,3 @@ echo -e "\n============================================================"
 echo "[OK] 所有服务已配置完毕！"
 echo "您可以访问 http://${SELECTED_IP}:${HTTP_PORT}/ 来查看所有订阅链接。"
 echo "============================================================"
-
