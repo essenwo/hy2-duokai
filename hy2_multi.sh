@@ -6,7 +6,7 @@ set -euo pipefail
 #  0) 选择模式（全新安装 / 仅维护任务）
 #  1) 获取公网 IPv4
 #  2) 安装依赖（如缺失）
-#  3) 生成域名（sslip.io -> nip.io -> xip.io）
+#  3) 生成域名（sslip.io -> nip.io）
 #  4) 安装 hysteria 二进制（若不存在）
 #  5) 生成主/多端口密码与端口列表（如未提供）
 #  6) 检查 /acme 现有证书；否则准备 ACME（并确保 80/tcp 可用）
@@ -428,6 +428,52 @@ restore_port_80_services_if_stopped() {
   fi
 }
 
+# [重要修复]：将原脚本末尾的生成自签证书函数移动到此处，以确保调用时已定义
+# ---- helper: 生成自签证书并导入到 /acme/shared ----
+generate_self_signed_cert() {
+  local dom="${SWITCHED_DOMAIN:-$HY2_DOMAIN}"
+  local ip="$SELECTED_IP"
+  mkdir -p /acme/shared
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "[*] 未检测到 openssl，尝试自动安装..."
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y openssl >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y openssl >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache openssl >/dev/null 2>&1 || true
+    fi
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    echo "[*] 生成自签证书用于临时启动..."
+    # 兼容性优先，尝试添加 SAN；若 -addext 不可用，退化为无 SAN
+    if openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout /acme/shared/privkey.pem -out /acme/shared/fullchain.pem \
+      -days 365 -subj "/CN=${dom}" -addext "subjectAltName=DNS:${dom},IP:${ip}" >/dev/null 2>&1; then
+      :
+    else
+      openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout /acme/shared/privkey.pem -out /acme/shared/fullchain.pem \
+        -days 365 -subj "/CN=${dom}" >/dev/null 2>&1 || true
+    fi
+    # 计算 SPKI pin（供客户端使用 pinSHA256，避免 insecure）
+    if command -v sha256sum >/dev/null 2>&1; then
+      PIN_SHA256="$(openssl x509 -pubkey -in /acme/shared/fullchain.pem 2>/dev/null | \
+        openssl pkey -pubin -outform DER 2>/dev/null | \
+        openssl dgst -sha256 -binary 2>/dev/null | base64 2>/dev/null)"
+    fi
+    USE_EXISTING_CERT=1
+    USE_CERT_PATH="/acme/shared/fullchain.pem"
+    USE_KEY_PATH="/acme/shared/privkey.pem"
+    echo "[OK] 自签证书已生成并导入 /acme/shared"
+  else
+    echo "[ERROR] 无 openssl，无法生成自签证书。请安装 openssl 或释放 80 端口以使用 ACME。"
+  fi
+}
+
 # 预申请证书：优先使用 acme.sh 的 standalone 模式在 80/tcp 上申请证书
 # 成功后将证书链接/复制到 /acme/shared 并设置 USE_EXISTING_CERT=1
 try_issue_cert_preflight() {
@@ -511,26 +557,21 @@ try_issue_cert_preflight() {
   fi
   local acme_output
   if ! acme_output=$("$acme_bin" "${issue_args[@]}" 2>&1); then
-    # 检测速率限制并尝试切换动态域名服务（sslip.io -> nip.io -> xip.io）
+    # 检测速率限制并尝试切换动态域名服务（sslip.io -> nip.io）
     if echo "$acme_output" | grep -E -iq "(rateLimited|too many certificates\s*\(5\)\s*already issued for this exact set of identifiers)"; then
       echo "[WARN] 预申请命中速率限制，尝试切换动态域名服务..."
       # 识别当前服务
       local current_service=""
       if echo "$domain" | grep -q "sslip.io"; then current_service="sslip.io"; fi
       if echo "$domain" | grep -q "nip.io"; then current_service="nip.io"; fi
-      if echo "$domain" | grep -q "xip.io"; then current_service="xip.io"; fi
 
       # 生成候选域名（跳过当前服务）
       local ip_dash="${SELECTED_IP//./-}"; local ip_dot="$SELECTED_IP"
       local switched=0
-      for svc in sslip.io nip.io xip.io; do
+      for svc in sslip.io nip.io; do
         [ "$svc" = "$current_service" ] && continue
         local new_domain
-        if [ "$svc" = "xip.io" ]; then
-          new_domain="${ip_dot}.${svc}"
-        else
-          new_domain="${ip_dash}.${svc}"
-        fi
+        new_domain="${ip_dash}.${svc}"
         echo "[*] 尝试使用备用域名：${new_domain}"
         local issue_args2=(--issue --standalone -d "$new_domain" --force)
         if [ "${ACME_STAGING:-0}" -eq 1 ]; then issue_args2+=(--staging); fi
@@ -1066,26 +1107,21 @@ if [ "$MISSING" -eq 1 ]; then
 fi
 
 # ===========================
-# 2) 生成域名（sslip.io -> nip.io -> xip.io -> warn）
+# 2) 生成域名（sslip.io -> nip.io）
 # ===========================
 IP_DASH="${SELECTED_IP//./-}"
 IP_DOT="${SELECTED_IP}"
 
-# 定义域名服务列表，按优先级排序
-DOMAIN_SERVICES=("sslip.io" "nip.io" "xip.io")
+# 定义域名服务列表，按优先级排序（移除已死服务 xip.io）
+DOMAIN_SERVICES=("sslip.io" "nip.io")
 HY2_DOMAIN=""
 
 echo "[*] 检测可用的域名解析服务..."
 
 # 遍历域名服务，找到第一个可用的
 for service in "${DOMAIN_SERVICES[@]}"; do
-  if [ "$service" = "xip.io" ]; then
-    # xip.io 使用点分格式
-    test_domain="${IP_DOT}.${service}"
-  else
-    # sslip.io 和 nip.io 使用横线格式
-    test_domain="${IP_DASH}.${service}"
-  fi
+  # sslip.io 和 nip.io 使用横线格式
+  test_domain="${IP_DASH}.${service}"
   
   echo "[*] 测试 ${service}: ${test_domain}"
   
@@ -1127,7 +1163,7 @@ done
 # 如果所有服务都不可用，发出警告但继续使用 sslip.io
 if [ -z "$HY2_DOMAIN" ]; then
   HY2_DOMAIN="${IP_DASH}.sslip.io"
-  echo "[WARN] 所有域名解析服务（sslip.io/nip.io/xip.io）都无法正确解析到 ${SELECTED_IP}。"
+  echo "[WARN] 所有域名解析服务（sslip.io/nip.io）都无法正确解析到 ${SELECTED_IP}。"
   echo "       将使用 ${HY2_DOMAIN}，但 ACME HTTP-01 可能失败。"
   echo "       请确保域名解析到本机且 80/tcp 可达。"
 fi
@@ -1154,7 +1190,7 @@ if ! command -v hysteria >/dev/null 2>&1; then
     asset="${HYST_ASSET_OVERRIDE}"
   fi
   mkdir -p /usr/local/bin
-url_default="https://github.com/apernet/hysteria/releases/latest/download/${asset}"
+  url_default="https://github.com/apernet/hysteria/releases/latest/download/${asset}"
   # 可通过环境变量指定镜像基地址（例如 ghproxy）：HYST_DOWNLOAD_BASE=https://ghproxy.com/https://github.com/apernet/hysteria/releases/latest/download
   # 若未指定则使用默认 + 常见镜像回退
   urls=()
@@ -1392,8 +1428,6 @@ if [ "$USE_EXISTING_CERT" -eq 0 ]; then
       CURRENT_SERVICE="sslip.io"
     elif echo "$HY2_DOMAIN" | grep -q "nip.io"; then
       CURRENT_SERVICE="nip.io"
-    elif echo "$HY2_DOMAIN" | grep -q "xip.io"; then
-      CURRENT_SERVICE="xip.io"
     fi
     
     # 尝试切换到下一个域名服务
@@ -1405,11 +1439,7 @@ if [ "$USE_EXISTING_CERT" -eq 0 ]; then
       fi
       
       # 生成新的测试域名
-      if [ "$service" = "xip.io" ]; then
-        new_domain="${IP_DOT}.${service}"
-      else
-        new_domain="${IP_DASH}.${service}"
-      fi
+      new_domain="${IP_DASH}.${service}"
       
       echo "[*] 尝试切换到 ${service}: ${new_domain}"
       
@@ -1822,47 +1852,3 @@ if [ -n "${HY2_PORTS:-}" ]; then
 fi
 echo
 echo "提示：导入订阅后，在 Clash 客户端将 Proxy 组或 Stream/Game/VoIP 组指向你的节点并测试。"
-# ---- helper: 生成自签证书并导入到 /acme/shared ----
-generate_self_signed_cert() {
-  local dom="${SWITCHED_DOMAIN:-$HY2_DOMAIN}"
-  local ip="$SELECTED_IP"
-  mkdir -p /acme/shared
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo "[*] 未检测到 openssl，尝试自动安装..."
-    if command -v apt-get >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1 || true
-    elif command -v yum >/dev/null 2>&1; then
-      yum install -y openssl >/dev/null 2>&1 || true
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y openssl >/dev/null 2>&1 || true
-    elif command -v apk >/dev/null 2>&1; then
-      apk add --no-cache openssl >/dev/null 2>&1 || true
-    fi
-  fi
-  if command -v openssl >/dev/null 2>&1; then
-    echo "[*] 生成自签证书用于临时启动..."
-    # 兼容性优先，尝试添加 SAN；若 -addext 不可用，退化为无 SAN
-    if openssl req -x509 -newkey rsa:2048 -nodes \
-      -keyout /acme/shared/privkey.pem -out /acme/shared/fullchain.pem \
-      -days 365 -subj "/CN=${dom}" -addext "subjectAltName=DNS:${dom},IP:${ip}" >/dev/null 2>&1; then
-      :
-    else
-      openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout /acme/shared/privkey.pem -out /acme/shared/fullchain.pem \
-        -days 365 -subj "/CN=${dom}" >/dev/null 2>&1 || true
-    fi
-    # 计算 SPKI pin（供客户端使用 pinSHA256，避免 insecure）
-    if command -v sha256sum >/dev/null 2>&1; then
-      PIN_SHA256="$(openssl x509 -pubkey -in /acme/shared/fullchain.pem 2>/dev/null | \
-        openssl pkey -pubin -outform DER 2>/dev/null | \
-        openssl dgst -sha256 -binary 2>/dev/null | base64 2>/dev/null)"
-    fi
-    USE_EXISTING_CERT=1
-    USE_CERT_PATH="/acme/shared/fullchain.pem"
-    USE_KEY_PATH="/acme/shared/privkey.pem"
-    echo "[OK] 自签证书已生成并导入 /acme/shared"
-  else
-    echo "[ERROR] 无 openssl，无法生成自签证书。请安装 openssl 或释放 80 端口以使用 ACME。"
-  fi
-}
