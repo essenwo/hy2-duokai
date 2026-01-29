@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================
-# 整合版 Hysteria2 一键脚本
+# 整合版 Hysteria2 一键脚本 (修正版)
 # 功能：
 # 1. 自动安装 Hysteria2 并配置多端口
 # 2. 自动安装 Cloudflare WARP (Proxy模式)
@@ -17,7 +17,6 @@ HY2_PORT_COUNT="${HY2_PORT_COUNT:-}"  # 端口数量（交互式输入会覆盖�
 HY2_PASS="${HY2_PASS:-}"              # 密码（留空自动生成）
 OBFS_PASS="${OBFS_PASS:-}"            # 混淆密码（留空自动生成）
 NAME_TAG="${NAME_TAG:-MyHysteria}"    # 节点名称
-PIN_SHA256="${PIN_SHA256:-}"          # 证书指纹（可留空）
 
 CLASH_WEB_DIR="${CLASH_WEB_DIR:-/etc/hysteria}"
 CLASH_OUT_PATH="${CLASH_OUT_PATH:-${CLASH_WEB_DIR}/clash_subscription.yaml}"
@@ -354,13 +353,15 @@ pkgs=(curl jq openssl python3 nginx)
 apt-get update -y
 apt-get install -y "${pkgs[@]}"
 
+# >>> [修复点] 安装完 Nginx 后立刻停止它，释放 80 端口给 Hysteria 申请证书用 <<<
+systemctl stop nginx || true
+
 # >>> [关键步骤] 安装 WARP <<<
 install_and_configure_warp
 
 # 3. 域名生成 (nip.io / sslip.io)
 IP_DASH="${SELECTED_IP//./-}"
 HY2_DOMAIN="${IP_DASH}.sslip.io"
-# 简化的域名检测逻辑，确保有域名可用
 echo "[OK] 使用域名: ${HY2_DOMAIN}"
 
 # 4. 安装 Hysteria 二进制
@@ -371,20 +372,17 @@ if ! command -v hysteria >/dev/null 2>&1; then
 fi
 
 # 5. 端口与密码处理
-# 这里会触发交互，询问你需要多少个端口
 maybe_init_ports_from_input
 PORT_LIST_CSV="$(parse_port_list)"
 gen_credentials_for_ports "$PORT_LIST_CSV"
 
-# 6. 证书申请 (简化版逻辑，实际使用原脚本的完整ACME逻辑)
-# 此处假设使用 ACME HTTP 申请，或者生成自签
+# 6. 证书申请 (简化版逻辑)
 mkdir -p /acme/autocert
 USE_EXISTING_CERT=0
-# (为节省篇幅，此处省略复杂的证书检测，默认尝试 ACME)
 
 # 7. 写入配置并启动
 echo "[*] 生成配置文件..."
-# 尝试 ACME 启动 (如果80端口空闲)
+# 尝试 ACME 启动 (80端口现在是空闲的，因为我们在第2步关掉了Nginx)
 write_hysteria_main_config 0
 
 cat >/etc/systemd/system/hysteria-server.service <<'SVC'
@@ -408,11 +406,9 @@ mkdir -p "${CLASH_WEB_DIR}"
 IFS=',' read -r -a clash_ports <<<"$PORT_LIST_CSV"
 
 for pt in "${clash_ports[@]}"; do
-  # 确定当前端口的密码
   curr_pass="${PASS_MAP[$pt]}"
   curr_obfs="${OBFS_MAP[$pt]}"
   
-  # 写入文件
   cat > "${CLASH_WEB_DIR}/clash_${pt}.yaml" <<EOF
 port: 7890
 socks-port: 7891
@@ -443,6 +439,7 @@ EOF
 done
 
 # 9. Nginx 配置
+# 配置 Nginx 监听 8080 端口，不再占用 80
 cat >/etc/nginx/sites-available/clash.conf <<EOF
 server {
     listen ${HTTP_PORT} default_server;
@@ -453,6 +450,7 @@ server {
 }
 EOF
 ln -sf /etc/nginx/sites-available/clash.conf /etc/nginx/sites-enabled/clash.conf
+# 重新启动 Nginx (现在它监听8080，不会和 Hysteria 的 80 冲突)
 systemctl restart nginx
 
 echo "======================================================="
