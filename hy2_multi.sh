@@ -1604,6 +1604,7 @@ proxies:
     obfs: salamander
     obfs-password: __OBFS_PASS__
     sni: __HY2_DOMAIN__
+    skip-cert-verify: true
 
 proxy-groups:
   - name: "🚀 节点选择"
@@ -1791,6 +1792,7 @@ proxies:
     obfs: salamander
     obfs-password: __OBFS_PASS__
     sni: __HY2_DOMAIN__
+    skip-cert-verify: true
 
 proxy-groups:
   - name: "🚀 节点选择"
@@ -1868,6 +1870,7 @@ proxies:
     obfs: salamander
     obfs-password: __OBFS_PASS__
     sni: __HY2_DOMAIN__
+    skip-cert-verify: true
 
 proxy-groups:
   - name: "🚀 节点选择"
