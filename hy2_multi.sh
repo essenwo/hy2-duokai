@@ -2,11 +2,11 @@
 set -euo pipefail
 
 echo "=========================================================="
-echo "   真正工业级 REALITY 自用部署脚本 (全绝对路径终极版)   "
+echo "   真正工业级 REALITY 自用部署脚本 (全客户端支持终极版)   "
 echo "=========================================================="
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y && apt-get install -y curl jq openssl uuid-runtime cron net-tools
+apt-get update -y && apt-get install -y curl jq openssl uuid-runtime cron net-tools wget unzip
 
 # 1. 自动获取准确的公网 IPv4
 PUBLIC_IP=$(curl -4 -s --connect-timeout 5 https://api.ip.sb/ip || curl -4 -s --connect-timeout 5 https://ifconfig.me || echo "")
@@ -15,25 +15,24 @@ if [ -z "$PUBLIC_IP" ]; then
   exit 1
 fi
 
-# 2. 强制拉取官方 Xray 核心 (不管之前有没有，强制覆盖安装，确保路径统一)
-echo "[*] 正在拉取官方 Xray 核心..."
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+# 2. 强行安装官方 Xray 核心 (使用稳固的物理覆盖，解决国内连接 GitHub 闪断问题)
+echo "[*] 正在部署官方 Xray 核心结构..."
+mkdir -p /usr/local/bin /usr/local/etc/xray
+cd /tmp
+wget -O xray.zip https://github.com/XTLS/Xray-core/releases/download/v24.11.21/Xray-linux-64.zip || {
+  echo "[*] GitHub 直连微弱，正在切换备用高加速源..."
+  wget -O xray.zip https://mirror.ghproxy.com/https://github.com/XTLS/Xray-core/releases/download/v24.11.21/Xray-linux-64.zip
+}
+unzip -o xray.zip -d /usr/local/bin/
+chmod +x /usr/local/bin/xray
+rm -f xray.zip
 
-# 3. 【彻底死锁路径】直接定义官方标准绝对路径，不再让系统乱找
+# 3. 死锁官方唯一标准绝对路径
 XRAY_BIN="/usr/local/bin/xray"
-if [ ! -f "$XRAY_BIN" ]; then
-  # 兜底检查另一个可能的位置
-  if [ -f "/usr/bin/xray" ]; then
-    XRAY_BIN="/usr/bin/xray"
-  else
-    echo "[ERROR] Xray 核心安装失败，未找到可执行文件"
-    exit 1
-  fi
-fi
 
-# 4. 交互式获取域名
+# 4. 交互式获取域名 (仅用于你的本地节点识别命名)
 if [ -t 0 ]; then
-  read -r -p "请输入您在 Cloudflare 解析的域名 (如 vps1.1564151.xyz): " DOMAIN || true
+  read -r -p "请输入您在 Cloudflare 解析的域名 (如 1564151.xyz): " DOMAIN || true
 else
   echo "[ERROR] 必须在交互式终端运行"
   exit 1
@@ -44,12 +43,12 @@ if [ -z "${DOMAIN:-}" ]; then
   exit 1
 fi
 
-# 5. 安全提取密钥对 (使用完全死锁的绝对路径)
+# 5. 安全提取密钥对 (使用完全死锁的绝对路径，彻底杜绝留空 Bug)
 UUID="$(uuidgen)"
 PORT="443"
 SID="$(openssl rand -hex 8)"
 
-# 用绝对路径生成密钥
+# 用绝对路径生成密钥，确保 100% 捕获成功
 $XRAY_BIN x25519 > /tmp/xray_keys.txt
 PRIVATE_KEY=$(awk '/Private key:/ {print $3}' /tmp/xray_keys.txt | tr -d '[:space:]')
 PUBLIC_KEY=$(awk '/Public key:/ {print $3}' /tmp/xray_keys.txt | tr -d '[:space:]')
@@ -60,8 +59,7 @@ if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
   exit 1
 fi
 
-# 6. 写入极致纯净的 Xray 配置文件 (纯净伪装微软)
-mkdir -p /usr/local/etc/xray
+# 6. 写入极致纯净的 Xray 配置文件 (徹底去除私人域名痕跡，純淨偽裝微軟)
 cat > /usr/local/etc/xray/config.json <<EOF
 {
   "log": {
@@ -132,7 +130,7 @@ systemctl daemon-reload
 systemctl enable xray
 systemctl restart xray
 
-# 8. 配置 5 分钟进程探活自愈看门狗
+# 8. 配置 5 分钟进程探活自愈看门狗 (零机场特征)
 mkdir -p /usr/local/bin
 cat > /usr/local/bin/xray-check.sh <<EOF
 #!/usr/bin/env bash
